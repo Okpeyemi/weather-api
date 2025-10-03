@@ -59,7 +59,7 @@ function labelWind(ms: number | null) {
   if (ms == null) return 'inconnu';
   if (ms > 10) return 'fort';
   if (ms > 5) return 'modéré';
-  return 'faible';
+  return 'léger';
 }
 
 function riskFromPrecipMm(mm: number | null) {
@@ -462,25 +462,44 @@ export async function POST(request: Request) {
       hist = await fetchHistoricalPOWERForDay(lat, lon, dateISO, 10);
     }
 
-    // Partie 4 — Analyse & combinaison des sources
+    // Partie 4 — Analyse & combinaison (méthode globale)
+    // 1) Valeurs prévues: privilégier GFS
     let tempC: number | null = forecast?.tempC ?? hist?.meanTemp ?? null;
     let windSpeed: number | null = forecast?.windSpeed ?? hist?.meanWind ?? null;
+    const cloudCover: number | null = forecast?.cloud ?? null;
 
-    // Rain risk
+    // 2) Probabilités/risques: baseline historique (POWER), boost par GFS
+    const hProb = hist?.histProb ?? null; // % jours PRECTOTCORR >= 1mm
+    const fProb = forecast?.precipProb ?? null; // % GFS (moyenne journalière)
+    const fMm = forecast?.precipMm ?? null; // mm/jour GFS
     let rainRisk: number | null = null;
-    if (forecast?.precipProb != null) {
-      // combine forecast probability and historical
-      const fProb = forecast.precipProb;
-      const hProb = hist?.histProb ?? fProb;
-      rainRisk = Math.round(0.7 * fProb + 0.3 * hProb);
-    } else if (forecast?.precipMm != null) {
-      const fProb = riskFromPrecipMm(forecast.precipMm);
-      const hProb = hist?.histProb ?? fProb;
-      rainRisk = Math.round(0.7 * fProb + 0.3 * hProb);
-    } else if (hist?.histProb != null) {
-      rainRisk = hist.histProb;
-    } else {
-      rainRisk = 50;
+    // Baseline
+    if (hProb != null) rainRisk = hProb;
+    else if (fProb != null) rainRisk = fProb;
+    else if (fMm != null) rainRisk = riskFromPrecipMm(fMm);
+    else rainRisk = 50;
+    // Boost si GFS indique pluie
+    if (fMm != null && fMm > 1) {
+      rainRisk = Math.min(100, rainRisk + (fMm > 5 ? 20 : 15));
+    } else if (fProb != null && fProb >= 30) {
+      rainRisk = Math.min(100, rainRisk + (fProb >= 60 ? 20 : 15));
+    }
+
+    // 3) Température: anomalie = prévue - moyenne historique
+    const tempAnomaly = (tempC != null && hist?.meanTemp != null)
+      ? Math.round((tempC - hist.meanTemp) * 10) / 10
+      : null;
+
+    // 4) Vent et ciel
+    const wind = labelWind(windSpeed);
+    const sky = cloudCover != null ? (cloudCover > 50 ? 'couvert' : 'peu nuageux') : 'inconnu';
+
+    // 5) Niveau de pluie
+    let rainLevel: 'fort' | 'risque' | 'faible' | 'inconnu' = 'inconnu';
+    if (fMm != null) {
+      rainLevel = fMm > 5 ? 'fort' : (fMm > 1 ? 'risque' : 'faible');
+    } else if (hProb != null) {
+      rainLevel = hProb > 50 ? 'risque' : 'faible';
     }
 
     // Ajustement par activité (simple): activités extérieures => plus conservateur
@@ -488,13 +507,31 @@ export async function POST(request: Request) {
       rainRisk = Math.min(100, Math.round((rainRisk ?? 50) * 1.15));
     }
 
-    const wind = labelWind(windSpeed);
+    // Journalisation de la fusion
+    console.log('[Étape 4] Fusion GFS + POWER (MERRA‑2/GPM)', {
+      historique_prob: hProb,
+      gfs_prob: fProb,
+      gfs_mm: fMm,
+      rainRisk_final: rainRisk,
+      rainLevel,
+      tempC,
+      meanTemp_hist: hist?.meanTemp ?? null,
+      tempAnomaly,
+      windSpeed,
+      cloudCover,
+      sky,
+    });
+
     // Partie 5 — Réponse formatée
     const response = {
       rainRisk: rainRisk ?? 50,
+      rainLevel,
       wind,
       temp: tempC != null ? Math.round(tempC * 10) / 10 : null,
-      source: isFuture && within16d ? 'GFS+ERA5' : 'ERA5',
+      tempAnomaly,
+      cloudCover,
+      sky,
+      source: isFuture && within16d ? 'GFS+POWER' : 'POWER',
       date: dateISO,
     };
     console.log('[predict] response summary', response);
